@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Checkout — OpenTicket</title>
+  <link rel="stylesheet" href="/css/common.css">
+  <link rel="stylesheet" href="/css/checkout.css">
+</head>
+<body>
+  
+  <header>
+    <h1>Checkout</h1>
+    <p>Step 2 of 3 — Confirm & Pay</p>
+    <hr>
+  </header>
+  
+  <main class="container">
+    <!-- 左欄 -->
+    <aside class="card">
+      <h2>Order Summary</h2>
+      <div id="order-summary"></div>
+      <hr>
+      <p><strong>Total:</strong> <span id="order-total">$0</span></p>
+    </aside>
+    
+    <!-- 右欄 -->
+    <section class="card">
+      <div class="section" id="customer">
+        <h2>Customer Info</h2>
+        <p id="cust-name"></p>
+        <p id="cust-phone"></p>
+        <p id="cust-email"></p>
+      </div>
+      
+      <div class="section" id="payment">
+        <h2>Payment Method</h2>
+        <div class="radio-group">
+          <label><input type="radio" name="pay" value="CARD"> Credit Card</label>
+          <label><input type="radio" name="pay" value="LINEPAY"> LINE Pay</label>
+          <label><input type="radio" name="pay" value="ATM"> ATM Transfer</label>
+        </div>
+      </div>
+      
+      <div id="atm-extra">
+        <p><strong>Company Bank Account</strong></p>
+        <p>
+          Bank: 012 First Commercial Bank<br>
+          Account Name: OpenTicket Co., Ltd.<br>
+          Account Number: 123-456-789-01234
+        </p>
+        <label>
+          帳號後五碼（Last 5 digits）<br>
+          <input id="atm-last5" type="text" maxlength="5" pattern="\d{5}" placeholder="e.g. 12345">
+        </label>
+      </div>
+      
+      <!-- Invoice -->
+      <div class="section" id="invoice">
+        <h2>Invoice</h2>
+        <div class="radio-group" id="invoice-group">
+          <!-- E-Invoice -->
+          <div class="inv-item">
+            <label><input type="radio" name="invoice" value="E_INVOICE"> E-Invoice</label>
+            <div id="einvoice-extra" class="inv-extra">
+              <p><strong>E-Invoice Options</strong></p>
+              <label><input type="radio" name="einv-option" value="SAME_EMAIL"> 同會員資訊之信箱</label>
+              <label><input type="radio" name="einv-option" value="CUSTOM_BARCODE"> 電子發票載具（手機條碼）</label>
+              <div id="einv-barcode-wrap">
+                <input id="einv-barcode" type="text" placeholder="/AB12345" pattern="\/[A-Za-z0-9]{7}">
+                <small>格式：<strong>/</strong>（斜線）+ 7 位英數字。</small>
+              </div>
+              <label><input type="radio" name="einv-option" value="CUSTOM_EMAIL"> 自填信箱</label>
+              <div id="einv-email-wrap">
+                <input id="einv-email" type="email" placeholder="example@domain.com">
+              </div>
+            </div>
+          </div>
+          
+          <!-- Donation -->
+          <div class="inv-item">
+            <label><input type="radio" name="invoice" value="DONATION"> Donation</label>
+            <div id="donation-extra" class="inv-extra">
+              <p><strong>Donation Options</strong></p>
+              <label><input type="radio" name="donation-option" value="UNITED_WAY"> 捐贈聯合勸募</label>
+              <label><input type="radio" name="donation-option" value="CUSTOM_CODE"> 自填捐贈單位代號</label>
+              <div id="donation-code-wrap">
+                <input id="donation-code" type="text" placeholder="輸入捐贈單位代號">
+              </div>
+            </div>
+          </div>
+          
+          <!-- Company -->
+          <div class="inv-item">
+            <label><input type="radio" name="invoice" value="COMPANY"> Company Invoice</label>
+            <div id="company-extra" class="inv-extra">
+              <p><strong>Company Info</strong></p>
+              <label>統一編號（8 碼）
+                <input id="tax-id" type="text" maxlength="8" pattern="\d{8}" placeholder="例如 12345678">
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Terms -->
+      <div class="section" id="terms">
+        <label><input type="checkbox" id="agree"> I agree to the Terms and Conditions</label>
+      </div>
+      
+      <!-- Buttons -->
+      <div class="action-bar">
+        <button id="backBtn" type="button">Back</button>
+        <button id="payBtn" disabled>Complete Purchase</button>
+      </div>
+    </section>
+  </main>
+  
+  <script src="/js/checkout.js"></script>
+  
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <p>正在確認訂單...</p>
+  </div>
+  
+</body>
+</html>

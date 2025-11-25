@@ -1,0 +1,38 @@
+spring:
+  datasource:
+    # 連本機或晉有
+    url: jdbc:mysql://926.synology.me:3306/otp?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Taipei&characterEncoding=UTF-8
+    username: sa
+    password: sa
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: false
+
+server:
+  port: 8080
+
+
+app:
+
+  # 測試綠界使用的回傳網址
+  # domain: https://heeled-shawnee-appositely.ngrok-free.dev
+  
+
+  domain: http://localhost:8080
+
+ecpay:
+  merchant-id: 2000132
+  hash-key: 5294y06JbISpM5x9
+  hash-iv: v77hoKGq4kWxNNIS
+  api-url: https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5
+  client-back-url: ${app.domain}/success.html
