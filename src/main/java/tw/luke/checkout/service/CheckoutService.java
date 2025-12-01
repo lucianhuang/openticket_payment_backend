@@ -1,4 +1,3 @@
-
 package tw.luke.checkout.service;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -12,52 +11,64 @@ import java.util.Map;
 
 @Service
 public class CheckoutService {
-
+    
     private final Map<String, PaymentStrategy> strategyMap;
     private final OrderRepository orderRepository;
-
+    
     @Autowired
     public CheckoutService(Map<String, PaymentStrategy> strategyMap, OrderRepository orderRepository) {
         this.strategyMap = strategyMap;
         this.orderRepository = orderRepository;
     }
-
+    
     @Transactional
-    // 回傳型別改成 Map<String, String>
     public Map<String, String> processOrder(CheckoutForm form) {
         
         validateInvoice(form);
         long currentUserId = 1L;
-
+        
+        // 1. 【創建預約鎖定】 (防止超賣，最優先執行) 關鍵在這
+        orderRepository.createReservations(currentUserId); 
+        
+        // 2. 【扣除庫存】 (鎖定成功後，再實際扣除庫存)
         orderRepository.decreaseStock(currentUserId);
+        
+        // 3. 【計算總金額】
         int totalAmount = orderRepository.calculateTotal(currentUserId);
-
+        
+        // 4. 【執行支付策略】 (會根據選擇的支付方式回傳 HTML 或狀態)
         PaymentStrategy strategy = strategyMap.get(form.paymentMethod());
         if (strategy == null) {
             throw new RuntimeException("不支援的付款方式: " + form.paymentMethod());
         }
-
-        // 策略回傳的仍然是 String (HTML 代碼 或 狀態字串)
         String result = strategy.pay(form);
-
+        
+        // 5. 【創建主訂單及明細】 (必須在支付策略執行後，因為需要總金額)
         orderRepository.createOrder(currentUserId, form, totalAmount);
+        
+        // 6. 【清空購物車】 (交易完成)
         orderRepository.clearCart(currentUserId);
-
-        // 如果結果是 HTML 表單 (綠界)，包進 Map 回傳
+        
+        // 7. 【回傳結果】
         if (result.startsWith("<form")) {
             return Map.of(
                 "status", "ecpay",
-                "message", result // 前端收到這個會把它塞進 innerHTML
+                "message", result // 回傳 HTML 給前端跳轉
             );
         }
-
-        // 一般 ATM 成功，也用 Map 回傳
+        
+        // 一般成功 (ATM)
         return Map.of(
             "status", "success", 
             "message", "訂單成功"
         );
     }
-
+    
+    
+    
+    
+    
+    
     private void validateInvoice(CheckoutForm form) {
         if (form.paymentMethod() == null || form.paymentMethod().isEmpty()) {
             throw new RuntimeException("請選擇付款方式");

@@ -81,81 +81,140 @@ public class OrderRepository {
         return total != null ? total.intValue() : 0;
     }
     
-public void createOrder(long userId, CheckoutForm form, int totalAmount) {
-    
-    // 1. 取得 Event ID (假設單筆訂單只對應一個 Event)
-    String eventSql = "SELECT distinct ett.event_id FROM otp.cart_items ci JOIN otp.event_ticket_type ett ON ci.event_ticket_type_id = ett.id WHERE ci.user_id = ?";
-    List<Long> eventIds = jdbcTemplate.queryForList(eventSql, Long.class, userId);
-    final Long eventId = eventIds.isEmpty() ? null : eventIds.get(0); 
-    
-    // 2. 處理發票和買家資訊 (從資料庫撈 CustomerDto)
-    final CustomerDto customer = jdbcTemplate.queryForObject( // 設為 final
-        "SELECT email FROM otp.user WHERE id = ?", 
-        (rs, rowNum) -> new CustomerDto("Test User", "0912-345-678", rs.getString("email")),
-        userId
-    );
-    
-    final String invType = form.invoiceType();
-    final String invOpt = form.invOption(); 
-    final String invVal = form.invoiceValue();
-    final String carrierType;
-    final String carrierCode;
-    final String taxId;
-    final String donationCode;
-    
-    if ("E_INVOICE".equals(invType)) {
-        carrierType = ("CUSTOM_BARCODE".equals(invOpt) || "SAME_EMAIL".equals(invOpt) || "CUSTOM_EMAIL".equals(invOpt)) ? ("CUSTOM_BARCODE".equals(invOpt) ? "Mobile Barcode" : "Email") : null;
-        carrierCode = "CUSTOM_BARCODE".equals(invOpt) ? invVal : null;
-        taxId = null;
-        donationCode = null;
-    } else if ("COMPANY".equals(invType)) {
-        carrierType = null;
-        carrierCode = null;
-        taxId = invVal;
-        donationCode = null;
-    } else if ("DONATION".equals(invType)) {
-        carrierType = null;
-        carrierCode = null;
-        taxId = null;
-        donationCode = invVal;
-    } else {
-        carrierType = null;
-        carrierCode = null;
-        taxId = null;
-        donationCode = null;
+    // 1.5. 建立預約鎖定 (Reservation Lock)
+    public void createReservations(long userId) {
+        
+        // 1. 獲取訂單明細 (需要 event_ticket_type_id 和 quantity)
+        String sqlItems = """
+            SELECT 
+                ci.quantity, ett.id AS event_ticket_type_id,
+                CASE
+                    WHEN ett.custom_price IS NOT NULL AND ett.custom_price > 0 THEN ett.custom_price
+                    ELSE tt_template.price
+                END AS price_at_purchase
+            FROM otp.cart_items ci
+            JOIN otp.event_ticket_type ett ON ci.event_ticket_type_id = ett.id
+            JOIN otp.ticket_type tt_template ON ett.ticket_template_id = tt_template.id
+            WHERE ci.user_id = ?
+        """;
+        List<Map<String, Object>> cartItems = jdbcTemplate.queryForList(sqlItems, userId);
+        
+        if (cartItems.isEmpty()) return;
+
+        // 2. 插入【預約鎖定主表】(otp.reservations) 並獲取 ID (使用 KeyHolder)
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        String insertReservationHeaderSql = """
+            INSERT INTO otp.reservations 
+            (userId, created_at, expires_at, status) 
+            VALUES (?, NOW(), DATE_ADD(NOW(), INTERVAL 15 MINUTE), 'LOCKED')
+        """;
+        // 鎖15分鐘這裡，要改可從這裡調整
+        
+        jdbcTemplate.update(connection -> {
+            PreparedStatement ps = connection.prepareStatement(insertReservationHeaderSql, Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, userId);
+            return ps;
+        }, keyHolder);
+
+        long reservationId = Objects.requireNonNull(keyHolder.getKey()).longValue();
+
+        // 3. 插入【預約鎖定明細表】(otp.reservation_items)
+        String insertReservationItemSql = """
+            INSERT INTO otp.reservation_items 
+            (reservationId, ticketTypeId, quantity, unitPrice) 
+            VALUES (?, ?, ?, ?)
+        """;
+        
+        for (Map<String, Object> item : cartItems) {
+            jdbcTemplate.update(insertReservationItemSql,
+                reservationId, // 外鍵
+                (Long) item.get("event_ticket_type_id"), // ⚠️ 這裡使用 event_ticket_type_id 作為 ticketTypeId
+                (Integer) item.get("quantity"),
+                (Integer) ((java.math.BigDecimal) item.get("price_at_purchase")).intValue() // ⚠️ 價格轉換為 INT
+            );
+        }
+        System.out.println("DEBUG: 成功為 User " + userId + " 創建預約鎖定 ID: " + reservationId);
     }
-    
-    // 4. 插入訂單主表(otp.orders) 並獲取 ID
-    KeyHolder keyHolder = new GeneratedKeyHolder();
-    String insertOrderSql = """
+
+
+
+
+
+    public void createOrder(long userId, CheckoutForm form, int totalAmount) {
+        
+        // 1. 取得 Event ID (假設單筆訂單只對應一個 Event)
+        String eventSql = "SELECT distinct ett.event_id FROM otp.cart_items ci JOIN otp.event_ticket_type ett ON ci.event_ticket_type_id = ett.id WHERE ci.user_id = ?";
+        List<Long> eventIds = jdbcTemplate.queryForList(eventSql, Long.class, userId);
+        final Long eventId = eventIds.isEmpty() ? null : eventIds.get(0); 
+        
+        // 2. 處理發票和買家資訊 (從資料庫撈 CustomerDto)
+        final CustomerDto customer = jdbcTemplate.queryForObject( // 設為 final
+            "SELECT email FROM otp.user WHERE id = ?", 
+            (rs, rowNum) -> new CustomerDto("Test User", "0912-345-678", rs.getString("email")),
+            userId
+        );
+        
+        final String invType = form.invoiceType();
+        final String invOpt = form.invOption(); 
+        final String invVal = form.invoiceValue();
+        final String carrierType;
+        final String carrierCode;
+        final String taxId;
+        final String donationCode;
+        
+        if ("E_INVOICE".equals(invType)) {
+            carrierType = ("CUSTOM_BARCODE".equals(invOpt) || "SAME_EMAIL".equals(invOpt) || "CUSTOM_EMAIL".equals(invOpt)) ? ("CUSTOM_BARCODE".equals(invOpt) ? "Mobile Barcode" : "Email") : null;
+            carrierCode = "CUSTOM_BARCODE".equals(invOpt) ? invVal : null;
+            taxId = null;
+            donationCode = null;
+        } else if ("COMPANY".equals(invType)) {
+            carrierType = null;
+            carrierCode = null;
+            taxId = invVal;
+            donationCode = null;
+        } else if ("DONATION".equals(invType)) {
+            carrierType = null;
+            carrierCode = null;
+            taxId = null;
+            donationCode = invVal;
+        } else {
+            carrierType = null;
+            carrierCode = null;
+            taxId = null;
+            donationCode = null;
+        }
+        
+        // 4. 插入訂單主表(otp.orders) 並獲取 ID
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        String insertOrderSql = """
         INSERT INTO otp.orders 
         (user_id, event_id, total_amount, status, buyer_email, buyer_name, buyer_phone,
          invoice_type, invoice_carrier_type, invoice_carrier_code, invoice_tax_id, invoice_donation_code, invoice_value) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """;
-    
-    // 執行插入並獲取主鍵
-    jdbcTemplate.update(connection -> {
-        PreparedStatement ps = connection.prepareStatement(insertOrderSql, Statement.RETURN_GENERATED_KEYS);
-        // 參數數量必須是 13 個
-        ps.setLong(1, userId);
-        ps.setObject(2, eventId);
-        ps.setInt(3, totalAmount);
-        ps.setString(4, "PENDING"); // status
-        ps.setString(5, customer.email()); // buyer_email
-        ps.setString(6, customer.name()); // buyer_name
-        ps.setString(7, customer.phone()); // buyer_phone
         
-        // 這裡使用的變數因為在外部沒有被重新賦值，所以是 "effectively final"
-        ps.setString(8, invType);       // invoice_type
-        ps.setObject(9, carrierType);   // invoice_carrier_type
-        ps.setObject(10, carrierCode);  // invoice_carrier_code
-        ps.setObject(11, taxId);        // invoice_tax_id
-        ps.setObject(12, donationCode); // invoice_donation_code
-        ps.setString(13, invVal);       // invoice_value (統編/載具碼/捐贈碼)
-        return ps;
-    }, keyHolder);
-
+        // 執行插入並獲取主鍵
+        jdbcTemplate.update(connection -> {
+            PreparedStatement ps = connection.prepareStatement(insertOrderSql, Statement.RETURN_GENERATED_KEYS);
+            // 參數數量必須是 13 個
+            ps.setLong(1, userId);
+            ps.setObject(2, eventId);
+            ps.setInt(3, totalAmount);
+            ps.setString(4, "PENDING"); // status
+            ps.setString(5, customer.email()); // buyer_email
+            ps.setString(6, customer.name()); // buyer_name
+            ps.setString(7, customer.phone()); // buyer_phone
+            
+            // 這裡使用的變數因為在外部沒有被重新賦值，所以是 "effectively final"
+            ps.setString(8, invType);       // invoice_type
+            ps.setObject(9, carrierType);   // invoice_carrier_type
+            ps.setObject(10, carrierCode);  // invoice_carrier_code
+            ps.setObject(11, taxId);        // invoice_tax_id
+            ps.setObject(12, donationCode); // invoice_donation_code
+            ps.setString(13, invVal);       // invoice_value (統編/載具碼/捐贈碼)
+            return ps;
+        }, keyHolder);
+        
         // 5. 獲取訂單 ID
         long orderId = Objects.requireNonNull(keyHolder.getKey()).longValue();
         
