@@ -15,42 +15,63 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/checkout")
 public class CheckoutController {
-
+    
     @Autowired
     private CheckoutService checkoutService;
-
+    
     @Autowired
     private JdbcTemplate jdbcTemplate;
-
-    // 1. 加入/更新購物車
+    
+    @Autowired
+    private tw.luke.checkout.repository.OrderRepository orderRepository;
+    
+    // 加入/更新購物車
     @PostMapping("/add")
     @Transactional
     public String addToCart(@RequestBody AddToCartForm form) {
-        if (form.quantity() > 4) throw new RuntimeException("最多 4 張");
-        
         long currentUserId = 1L; 
         long ticketTypeId = form.ticketTypeId();
-        int newQuantity = form.quantity();
-
-        if (newQuantity <= 0) {
-            jdbcTemplate.update("DELETE FROM cart_items WHERE user_id = ? AND ticket_type_id = ?", currentUserId, ticketTypeId);
+        int quantityToAdd = form.quantity();
+        
+        // 防呆
+        if (quantityToAdd <= 0) {
+            jdbcTemplate.update("DELETE FROM cart_items WHERE user_id = ? AND event_ticket_type_id = ?", currentUserId, ticketTypeId);
             return "{\"status\": \"success\", \"message\": \"Item removed\"}";
         }
-
-        Integer count = jdbcTemplate.queryForObject(
-            "SELECT COUNT(*) FROM cart_items WHERE user_id = ? AND ticket_type_id = ?",
-            Integer.class, currentUserId, ticketTypeId
-        );
-
-        if (count != null && count > 0) {
-            jdbcTemplate.update("UPDATE cart_items SET quantity = ? WHERE user_id = ? AND ticket_type_id = ?", newQuantity, currentUserId, ticketTypeId);
-        } else {
-            jdbcTemplate.update("INSERT INTO cart_items (user_id, ticket_type_id, quantity) VALUES (?, ?, ?)", currentUserId, ticketTypeId, newQuantity);
+        
+        // 計算「預期總數量」 (原本購物車有的 + 這次要加的)
+        // 先查購物車現在有幾張 (如果沒有就是 0)
+        String sqlCount = "SELECT COALESCE(SUM(quantity), 0) FROM cart_items WHERE user_id = ? AND event_ticket_type_id = ?";
+        Integer currentCartQty = jdbcTemplate.queryForObject(sqlCount, Integer.class, currentUserId, ticketTypeId);
+        
+        int finalQuantity = currentCartQty + quantityToAdd;
+        
+        // 檢查規則 ：單次限購規則 (例如總數不能超過 4) 
+        // 這裡假設要檢查總數
+        if (finalQuantity > 4) {
+            throw new RuntimeException("單一票種每人限購 4 張");
         }
+        
+        // 檢查規則 ：資料庫庫存檢查 (Call Repository) 
+        // KEY point
+        // 呼叫 checkStock
+        boolean isStockEnough = orderRepository.checkStock(ticketTypeId, finalQuantity);
+        
+        if (!isStockEnough) {
+            throw new RuntimeException("庫存不足！無法加入購物車");
+        }
+        
+        // 執行加入/更新
+        if (currentCartQty > 0) {
+            jdbcTemplate.update("UPDATE cart_items SET quantity = ? WHERE user_id = ? AND event_ticket_type_id = ?", finalQuantity, currentUserId, ticketTypeId);
+        } else {
+            jdbcTemplate.update("INSERT INTO cart_items (user_id, event_ticket_type_id, quantity) VALUES (?, ?, ?)", currentUserId, ticketTypeId, finalQuantity);
+        }
+        
         return "{\"status\": \"success\", \"message\": \"Cart updated\"}";
     }
-
-    // 2. 取得結帳頁面資訊
+    
+    // 取得結帳頁面資訊
     @GetMapping("/summary")
     public CheckoutStubResponse getCheckoutSummary() {
         long currentUserId = 1L;
@@ -72,7 +93,7 @@ public class CheckoutController {
             JOIN otp.event e ON ett.event_id = e.id
             WHERE ci.user_id = ?
         """;
-
+        
         List<OrderItemDto> order = jdbcTemplate.query(sql, (rs, rowNum) -> {
             double price = rs.getDouble("unit_price");
             int qty = rs.getInt("quantity");
@@ -86,17 +107,17 @@ public class CheckoutController {
                 price * qty // 由於 price 和 subtotal 已經是 double，這裡的計算結果也是 double
             );
         }, currentUserId);
-
+        
         CustomerDto customer = jdbcTemplate.queryForObject(
-                "SELECT email FROM otp.user WHERE id = ?", 
-                (rs, rowNum) -> {
-                    String email = rs.getString("email");
-                    // 這裡使用假資料 ("Stub Name", "0912-345-678") 來滿足 CustomerDto 的結構
-                    return new CustomerDto("Test User", "0912-345-678", email);
-                },
-                currentUserId
+            "SELECT email FROM otp.user WHERE id = ?", 
+            (rs, rowNum) -> {
+                String email = rs.getString("email");
+                // 這裡使用假資料 ("Stub Name", "0912-345-678") 來滿足 CustomerDto 的結構
+                return new CustomerDto("Test User", "0912-345-678", email);
+            },
+            currentUserId
         );
-
+        
         int totalAmount = (int) order.stream().mapToDouble(OrderItemDto::subtotal).sum();
         return new CheckoutStubResponse(customer, order, totalAmount);
     }
@@ -104,16 +125,16 @@ public class CheckoutController {
     // 輔助 API
     @GetMapping("/my-cart-simple")
     public List<Map<String, Object>> getMyCartSimple() {
-        return jdbcTemplate.queryForList("SELECT ticket_type_id, quantity FROM cart_items WHERE user_id = ?", 1L);
+        return jdbcTemplate.queryForList("SELECT event_ticket_type_id AS ticket_type_id, quantity FROM cart_items WHERE user_id = ?", 1L);
     }
-
-    // 3. 送出訂單 (給前端 JS 呼叫)
+    
+    // 送出訂單 (給前端 JS 呼叫)
     @PostMapping("/submit")
     public Map<String, String> submitOrder(@RequestBody CheckoutForm form) {
         return checkoutService.processOrder(form);
     }
-
-    // 4. 綠界交易
+    
+    // 綠界交易
     @RequestMapping(value = "/ecpay-return", method = {RequestMethod.POST, RequestMethod.GET})
     public void ecpayReturn(HttpServletResponse response) throws IOException {
         System.out.println("收到綠界回傳 (POST/GET)，準備跳轉 success.html");

@@ -20,38 +20,51 @@ public class OrderRepository {
     @Autowired
     private JdbcTemplate jdbcTemplate;
     
-    // 1. 檢查並扣除庫存
+    
+    // 檢查並扣除庫存 (修正版：處理 INT UNSIGNED 轉型問題)
     public void decreaseStock(long userId) {
-        // 撈出購物車內容，FK 欄位名已改為 event_ticket_type_id)
+        // 先把使用者購物車裡的東西撈出來
         String sqlCart = "SELECT event_ticket_type_id, quantity FROM otp.cart_items WHERE user_id = ?";
         List<Map<String, Object>> cartItems = jdbcTemplate.queryForList(sqlCart, userId);
         
-        // 除錯
-        System.out.println("DEBUG: User " + userId + " 正在結帳，購物車內有 " + cartItems.size() + " 筆商品");
         if (cartItems.isEmpty()) {
             throw new RuntimeException("購物車是空的，無法結帳");
         }
         
-        // 迴圈檢查並扣庫存 (從 otp.event_ticket_type.custom_limit 檢查)
+        // 逐筆檢查庫存
         for (Map<String, Object> item : cartItems) {
-            // 這裡的 Long 是 Long，但在資料庫中可能設置為 INT 或 BIGINT
-            // 為了避免 ClassCastException，請確保資料庫的 ID 欄位與此處類型匹配
             Long eventTicketId = (Long) item.get("event_ticket_type_id"); 
             Integer buyQty = (Integer) item.get("quantity");
             
-            // 檢查庫存 (從 otp.event_ticket_type.custom_limit 檢查)
-            Integer currentLimit = jdbcTemplate.queryForObject(
-                "SELECT custom_limit FROM otp.event_ticket_type WHERE id = ?", 
-                Integer.class, eventTicketId
-            );
+            // 查詢該票種的限量設定 (is_limited) 和 剩餘數量 (custom_limit) 
+            String sqlCheck = "SELECT is_limited, custom_limit FROM otp.event_ticket_type WHERE id = ?";
+            Map<String, Object> ticketInfo = jdbcTemplate.queryForMap(sqlCheck, eventTicketId);
             
-            // 如果 custom_limit 是 NULL (代表無限量)，或庫存不足
-            if (currentLimit != null && currentLimit < buyQty) {
-                throw new RuntimeException("很抱歉，部分商品庫存不足！(剩餘: " + currentLimit + ")");
+            // 處理 is_limited
+            Object isLimitedObj = ticketInfo.get("is_limited");
+            boolean isLimited = false;
+            if (isLimitedObj instanceof Number) {
+                isLimited = ((Number) isLimitedObj).intValue() == 1;
+            } else if (isLimitedObj instanceof Boolean) {
+                isLimited = (Boolean) isLimitedObj;
             }
             
-            // 扣除庫存 (只在 custom_limit 非 NULL 時才扣除)
-            if (currentLimit != null) {
+            // 取得 custom_limit
+            Object limitObj = ticketInfo.get("custom_limit");
+            Integer currentLimit = null;
+            
+            // 先轉成 Number，再取 intValue()，這樣不管是 Long (INT UNSIGNED) 還是 Integer (INT) 都不會報錯
+            if (limitObj != null) {
+                currentLimit = ((Number) limitObj).intValue();
+            }
+            
+            if (isLimited) {
+                // 檢查剩餘數量是否足夠
+                if (currentLimit == null || currentLimit < buyQty) {
+                    throw new RuntimeException("很抱歉，部分商品庫存不足！(剩餘: " + (currentLimit == null ? 0 : currentLimit) + ")");
+                }
+                
+                // 扣除庫存
                 jdbcTemplate.update(
                     "UPDATE otp.event_ticket_type SET custom_limit = custom_limit - ? WHERE id = ?",
                     buyQty, eventTicketId
@@ -60,9 +73,12 @@ public class OrderRepository {
         }
     }
     
-    // 2. 計算總金額，使用三層聯結和價格 CASE 邏輯
+    
+    
+    
+    
+    // 計算總金額
     public Integer calculateTotal(long userId) {
-        // 使用 Double 進行計算，避免 DECIMAL 轉 INT 錯誤
         String sqlTotal = """
             SELECT COALESCE(SUM(
                 ci.quantity * CASE
@@ -76,18 +92,20 @@ public class OrderRepository {
             WHERE ci.user_id = ?
         """;
         
-        // 接收結果為 Double，再轉為 Integer，因為 CheckoutService 預期 Integer
         Double total = jdbcTemplate.queryForObject(sqlTotal, Double.class, userId);
         return total != null ? total.intValue() : 0;
     }
     
-    // 1.5. 建立預約鎖定 (Reservation Lock)
+    // 建立預約鎖定 (Reservation Lock)
     public void createReservations(long userId) {
         
-        // 1. 獲取訂單明細 (需要 event_ticket_type_id 和 quantity)
+        // 獲取訂單明細
+        // 撈 ett.event_id 以符合 Foreign Key 限制
         String sqlItems = """
             SELECT 
-                ci.quantity, ett.id AS event_ticket_type_id,
+                ci.quantity, 
+                ett.id AS event_ticket_type_id,
+                ett.event_id, 
                 CASE
                     WHEN ett.custom_price IS NOT NULL AND ett.custom_price > 0 THEN ett.custom_price
                     ELSE tt_template.price
@@ -100,25 +118,63 @@ public class OrderRepository {
         List<Map<String, Object>> cartItems = jdbcTemplate.queryForList(sqlItems, userId);
         
         if (cartItems.isEmpty()) return;
-
-        // 2. 插入【預約鎖定主表】(otp.reservations) 並獲取 ID (使用 KeyHolder)
+        
+        final int totalQuantity = cartItems.stream().mapToInt(item -> (Integer) item.get("quantity")).sum();
+        final Integer totalAmount = calculateTotal(userId); 
+        
+        // 取得真正的 Event ID (解決 Foreign Key 錯誤)
+        final Long realEventId = cartItems.stream()
+        .map(item -> (Long) item.get("event_id"))
+        .filter(Objects::nonNull) 
+        .findFirst()
+        .orElseThrow(() -> new RuntimeException("無法從購物車取得有效的活動 ID (Event ID)"));
+        
+        // 取得票種 ID (作為 ticket_type_id 和 scheduleId 的填充值)
+        final Long proxyTicketTypeId = (Long) cartItems.get(0).get("event_ticket_type_id");
+        
+        // 寫入資料庫 ---
         KeyHolder keyHolder = new GeneratedKeyHolder();
+        
+        // 針對 reservations 表結構，填入所有 Not Null 欄位
         String insertReservationHeaderSql = """
             INSERT INTO otp.reservations 
-            (userId, created_at, expires_at, status) 
-            VALUES (?, NOW(), DATE_ADD(NOW(), INTERVAL 15 MINUTE), 'LOCKED')
+            (user_id, event_id, quantity, ticket_type_id, totalAmount, scheduleId, userId, created_at, expires_at, status) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 15 MINUTE), 'LOCKED')
         """;
-        // 鎖15分鐘這裡，要改可從這裡調整
         
         jdbcTemplate.update(connection -> {
             PreparedStatement ps = connection.prepareStatement(insertReservationHeaderSql, Statement.RETURN_GENERATED_KEYS);
-            ps.setLong(1, userId);
+            
+            // user_id (bigint)
+            ps.setLong(1, userId);                 
+            
+            // event_id (bigint, FK) 
+            // 放入從 DB 查出的 realEventId
+            ps.setObject(2, realEventId);          
+            
+            // quantity (int)
+            ps.setInt(3, totalQuantity);           
+            
+            // ticket_type_id (bigint, FK)
+            ps.setObject(4, proxyTicketTypeId);    
+            
+            // totalAmount (int)
+            ps.setInt(5, totalAmount);             
+            
+            // scheduleId (int, Not Null) 
+            // 因為沒有 schedule 表，這裡暫時填入票種 ID 的整數值以避免報錯
+            ps.setInt(6, proxyTicketTypeId.intValue()); 
+            
+            // userId (int, Not Null) 
+            // 這是表中的第 14 欄，注意它是 INT 型別，需轉型
+            ps.setInt(7, (int) userId);                 
+            
             return ps;
         }, keyHolder);
-
+        
         long reservationId = Objects.requireNonNull(keyHolder.getKey()).longValue();
-
-        // 3. 插入【預約鎖定明細表】(otp.reservation_items)
+        
+        // 預約鎖定明細表 (otp.reservation_items)
         String insertReservationItemSql = """
             INSERT INTO otp.reservation_items 
             (reservationId, ticketTypeId, quantity, unitPrice) 
@@ -127,19 +183,16 @@ public class OrderRepository {
         
         for (Map<String, Object> item : cartItems) {
             jdbcTemplate.update(insertReservationItemSql,
-                reservationId, // 外鍵
-                (Long) item.get("event_ticket_type_id"), // ⚠️ 這裡使用 event_ticket_type_id 作為 ticketTypeId
+                reservationId, 
+                (Long) item.get("event_ticket_type_id"), 
                 (Integer) item.get("quantity"),
-                (Integer) ((java.math.BigDecimal) item.get("price_at_purchase")).intValue() // ⚠️ 價格轉換為 INT
+                (Integer) ((java.math.BigDecimal) item.get("price_at_purchase")).intValue()
             );
         }
         System.out.println("DEBUG: 成功為 User " + userId + " 創建預約鎖定 ID: " + reservationId);
     }
-
-
-
-
-
+    
+    // 建立正式訂單 (Order)
     public void createOrder(long userId, CheckoutForm form, int totalAmount) {
         
         // 1. 取得 Event ID (假設單筆訂單只對應一個 Event)
@@ -148,9 +201,12 @@ public class OrderRepository {
         final Long eventId = eventIds.isEmpty() ? null : eventIds.get(0); 
         
         // 2. 處理發票和買家資訊 (從資料庫撈 CustomerDto)
-        final CustomerDto customer = jdbcTemplate.queryForObject( // 設為 final
-            "SELECT email FROM otp.user WHERE id = ?", 
-            (rs, rowNum) -> new CustomerDto("Test User", "0912-345-678", rs.getString("email")),
+        final CustomerDto customer = jdbcTemplate.queryForObject(
+            "SELECT account FROM otp.user WHERE id = ?",
+            (rs, rowNum) -> {
+                String email = rs.getString("account");
+                return new CustomerDto("Test User", "0912-345-678", email);
+            },
             userId
         );
         
@@ -187,33 +243,30 @@ public class OrderRepository {
         // 4. 插入訂單主表(otp.orders) 並獲取 ID
         KeyHolder keyHolder = new GeneratedKeyHolder();
         String insertOrderSql = """
-        INSERT INTO otp.orders 
-        (user_id, event_id, total_amount, status, buyer_email, buyer_name, buyer_phone,
-         invoice_type, invoice_carrier_type, invoice_carrier_code, invoice_tax_id, invoice_donation_code, invoice_value) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """;
+            INSERT INTO otp.orders 
+            (user_id, event_id, total_amount, status,
+             invoice_type, invoice_carrier_type, invoice_carrier_code, invoice_tax_id, invoice_donation_code, invoice_value) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """;
         
         // 執行插入並獲取主鍵
         jdbcTemplate.update(connection -> {
             PreparedStatement ps = connection.prepareStatement(insertOrderSql, Statement.RETURN_GENERATED_KEYS);
-            // 參數數量必須是 13 個
+            
             ps.setLong(1, userId);
             ps.setObject(2, eventId);
             ps.setInt(3, totalAmount);
             ps.setString(4, "PENDING"); // status
-            ps.setString(5, customer.email()); // buyer_email
-            ps.setString(6, customer.name()); // buyer_name
-            ps.setString(7, customer.phone()); // buyer_phone
-            
-            // 這裡使用的變數因為在外部沒有被重新賦值，所以是 "effectively final"
-            ps.setString(8, invType);       // invoice_type
-            ps.setObject(9, carrierType);   // invoice_carrier_type
-            ps.setObject(10, carrierCode);  // invoice_carrier_code
-            ps.setObject(11, taxId);        // invoice_tax_id
-            ps.setObject(12, donationCode); // invoice_donation_code
-            ps.setString(13, invVal);       // invoice_value (統編/載具碼/捐贈碼)
+            ps.setString(5, invType);       // invoice_type
+            ps.setObject(6, carrierType);   // invoice_carrier_type
+            ps.setObject(7, carrierCode);   // invoice_carrier_code
+            ps.setObject(8, taxId);         // invoice_tax_id
+            ps.setObject(9, donationCode);  // invoice_donation_code
+            ps.setString(10, invVal);       // invoice_value
             return ps;
         }, keyHolder);
+        
+        
         
         // 5. 獲取訂單 ID
         long orderId = Objects.requireNonNull(keyHolder.getKey()).longValue();
@@ -236,16 +289,17 @@ public class OrderRepository {
         
         String insertItemSql = """
             INSERT INTO otp.checkout_orders 
-            (order_id, event_ticket_type_id, price_at_purchase, quantity) 
-            VALUES (?, ?, ?, ?)
+            (order_id, event_ticket_type_id, price_at_purchase, quantity, event_id) 
+            VALUES (?, ?, ?, ?, ?)
         """;
         
         for (Map<String, Object> item : cartItems) {
             jdbcTemplate.update(insertItemSql,
                 orderId, 
                 (Long) item.get("event_ticket_type_id"),
-                (java.math.BigDecimal) item.get("price_at_purchase"), // 價格是 DECIMAL
-                (Integer) item.get("quantity")
+                (java.math.BigDecimal) item.get("price_at_purchase"), 
+                (Integer) item.get("quantity"),
+                eventId 
             );
         }
     }
@@ -253,5 +307,48 @@ public class OrderRepository {
     // 清空購物車
     public void clearCart(long userId) {
         jdbcTemplate.update("DELETE FROM otp.cart_items WHERE user_id = ?", userId);
+    }
+    
+    
+    // 單純檢查庫存是否足夠 (給 Controller 的 Add 使用)
+    public boolean checkStock(long ticketTypeId, int requiredQuantity) {
+        String sql = "SELECT is_limited, custom_limit FROM otp.event_ticket_type WHERE id = ?";
+        
+        try {
+            Map<String, Object> ticketInfo = jdbcTemplate.queryForMap(sql, ticketTypeId);
+            
+            // 處理 is_limited
+            Object isLimitedObj = ticketInfo.get("is_limited");
+            boolean isLimited = false;
+            if (isLimitedObj instanceof Number) {
+                isLimited = ((Number) isLimitedObj).intValue() == 1;
+            } else if (isLimitedObj instanceof Boolean) {
+                isLimited = (Boolean) isLimitedObj;
+            }
+            
+            // 如果是無限量，直接回傳 true (庫存充足)
+            if (!isLimited) {
+                return true;
+            }
+            
+            // 處理 custom_limit (安全轉型)
+            Object limitObj = ticketInfo.get("custom_limit");
+            Integer currentStock = null;
+            if (limitObj != null) {
+                currentStock = ((Number) limitObj).intValue();
+            }
+            
+            // 判斷庫存
+            // 如果庫存是 null 或是 庫存 < 需要的數量，代表不足
+            if (currentStock == null || currentStock < requiredQuantity) {
+                return false; 
+            }
+            
+            return true; // 庫存足夠
+            
+        } catch (Exception e) {
+            // 如果查不到該票種，視為庫存不足或錯誤
+            return false;
+        }
     }
 }
